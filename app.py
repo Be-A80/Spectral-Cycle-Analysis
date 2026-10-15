@@ -7,10 +7,10 @@ from scipy.signal import find_peaks
 from datetime import datetime, timezone, date, timedelta
 
 # ----------------- Seiten-Konfiguration -----------------
-st.set_page_config(page_title="Hurst Zyklus-Summenkurve", page_icon="🌊", layout="wide")
+st.set_page_config(page_title="Ehlers Dominant Cycle & Summenkurve", page_icon="📡", layout="wide")
 
-st.title("🌊 Zykluskomponenten & Composite-Summenkurve (Hurst-Modell)")
-st.caption("Ermittelt automatisch dominante Zyklen mittels FFT-Spektralanalyse und projiziert die Summenwelle in die Zukunft.")
+st.title("📡 Ehlers Dominant Cycle Finder & Composite-Projektion")
+st.caption("Objektive Erkennung des dominanten Zyklus mittels Ehlers-Autokorrelation mit anschließender Projektion.")
 
 # US-kompatible Datenquelle (Kraken)
 @st.cache_resource
@@ -39,20 +39,17 @@ with st.sidebar:
     
     tf_options = list(TF_CONFIG.keys())
     tf_choice = st.selectbox("Timeframe", options=tf_options, index=tf_options.index("1d"))
+    lookback_bars = st.slider("Historischer Analysebereich (Kerzen)", min_value=80, max_value=600, value=300, step=20)
     
     st.markdown("---")
-    st.subheader("🔍 Analyse-Zeitraum & Filter")
-    lookback_bars = st.slider("Historischer Analysebereich (Kerzen)", min_value=60, max_value=500, value=250, step=10)
-    
-    min_cycle = st.number_input("Minimale Zykluslänge (Kerzen)", min_value=3, max_value=30, value=8, step=1)
-    max_cycle = st.number_input("Maximale Zykluslänge (Kerzen)", min_value=30, max_value=200, value=90, step=5)
-    
-    num_cycles = st.slider("Anzahl dominanter Zyklen für Summe", min_value=1, max_value=8, value=3, step=1)
+    st.subheader("📡 Ehlers Cycle Scanner")
+    min_period = st.number_input("Minimale Periode (Kerzen)", min_value=5, max_value=30, value=8, step=1)
+    max_period = st.number_input("Maximale Periode (Kerzen)", min_value=20, max_value=150, value=70, step=5)
     
     st.markdown("---")
-    st.subheader("🔮 Zukunftsprojektion")
-    forecast_bars = st.slider("Projektion in die Zukunft (Kerzen)", min_value=10, max_value=120, value=30, step=5)
-    include_trend = st.checkbox("Grundtrend in die Summenkurve einrechnen", value=True)
+    st.subheader("🔮 Projektion")
+    forecast_bars = st.slider("Projektionshorizont (Kerzen)", min_value=10, max_value=100, value=30, step=5)
+    include_trend = st.checkbox("Grundtrend in Summenkurve einrechnen", value=True)
     
     st.button("🔄 Analyse ausführen", use_container_width=True)
 
@@ -79,65 +76,91 @@ def fetch_candles(coin, tf_choice):
         
     return df
 
-# ----------------- Zyklusanalyse (FFT Spektralanalyse) -----------------
-def analyze_cycles(prices, min_c, max_c, top_k):
+# ----------------- Ehlers Autokorrelations-Algorithmus -----------------
+def ehlers_autocorrelation_periodogram(prices, min_p, max_p):
+    """
+    Berechnet das Ehlers-Autokorrelations-Spektrum.
+    Ermittelt die Korrelation zwischen Zeitfenstern zur Erkennung des dominanten Zyklus.
+    """
+    # 1. Detrending über Log-Returns (stationäre Zeitreihe)
+    detrended = np.diff(np.log(prices))
+    n = len(detrended)
+    
+    periods = np.arange(min_p, max_p + 1)
+    correlations = []
+    
+    for p in periods:
+        if n < 2 * p:
+            correlations.append(0.0)
+            continue
+        
+        # Die letzten p Kerzen mit den vorangegangenen p Kerzen korrelieren
+        x = detrended[-p:]
+        y = detrended[-2 * p : -p]
+        
+        std_x = np.std(x)
+        std_y = np.std(y)
+        if std_x > 1e-8 and std_y > 1e-8:
+            r = np.corrcoef(x, y)[0, 1]
+            correlations.append(max(0.0, r))  # Negative Korrelationen auf 0 kappen
+        else:
+            correlations.append(0.0)
+            
+    corr_arr = np.array(correlations)
+    
+    # Höchsten Peak als dominanten Zyklus identifizieren
+    if len(corr_arr) == 0 or np.all(corr_arr == 0):
+        return int(min_p), 0.0, periods, corr_arr
+        
+    best_idx = np.argmax(corr_arr)
+    dom_period = int(periods[best_idx])
+    confidence = float(corr_arr[best_idx]) * 100.0  # In Prozent
+    
+    return dom_period, confidence, periods, corr_arr
+
+# ----------------- Multi-Harmonische Rekonstruktion -----------------
+def fit_cyclical_model(prices, dom_p, forecast_n):
+    """
+    Passt eine Sinusschwingung des dominanten Zyklus sowie seiner Oberschwingung (Harmonische)
+    an die Kurshistorie an und projiziert sie in die Zukunft.
+    """
     N = len(prices)
     x = np.arange(N)
     
-    # 1. Linearen Trend entfernen (Detrending)
+    # 1. Linearen Trend berechnen
     poly = np.polyfit(x, prices, deg=1)
-    trend_line = np.polyval(poly, x)
-    detrended = prices - trend_line
+    trend_hist = np.polyval(poly, x)
+    detrended = prices - trend_hist
     
-    # Fensterfunktion gegen spektrale Leckage (Tapering)
-    window = np.hanning(N)
-    windowed = detrended * window
+    # 2. Fourier-Koeffizienten für die dominante Frequenz & Harmonische berechnen
+    # Grundfrequenz w1 = 2*pi / dom_p, erste Oberschwingung w2 = 2*pi / (dom_p / 2)
+    periods_to_fit = [dom_p, max(4.0, dom_p / 2.0)]
     
-    # 2. Fourier-Transformation (FFT)
-    fft_vals = np.fft.rfft(windowed)
-    freqs = np.fft.rfftfreq(N, d=1.0)
-    amplitudes = np.abs(fft_vals) * 2.0 / N
-    phases = np.angle(np.fft.rfft(detrended))  # Phase auf Original-Detrended berechnen
+    total_len = N + forecast_n
+    x_full = np.arange(total_len)
+    composite_wave = np.zeros(total_len)
+    wave_details = {}
     
-    # Frequenzen in Perioden (Länge in Kerzen) umrechnen
-    periods = np.zeros_like(freqs)
-    valid_freq_idx = freqs > 0
-    periods[valid_freq_idx] = 1.0 / freqs[valid_freq_idx]
-    
-    # Nur Zyklen im gewünschten Längenbereich filtern
-    in_range = (periods >= min_c) & (periods <= max_c)
-    filtered_indices = np.where(in_range)[0]
-    
-    if len(filtered_indices) == 0:
-        return [], trend_line, poly, detrended
-    
-    # Peaks im Spektrum finden
-    amps_in_range = amplitudes[filtered_indices]
-    peak_sub_idx, _ = find_peaks(amps_in_range)
-    
-    if len(peak_sub_idx) > 0:
-        candidate_idx = filtered_indices[peak_sub_idx]
-    else:
-        candidate_idx = filtered_indices
+    for idx, p in enumerate(periods_to_fit):
+        w = 2.0 * np.pi / p
+        sin_basis = np.sin(w * x)
+        cos_basis = np.cos(w * x)
         
-    # Nach Amplitude (Stärke) sortieren
-    sorted_candidates = candidate_idx[np.argsort(amplitudes[candidate_idx])[::-1]]
-    top_indices = sorted_candidates[:top_k]
-    
-    components = []
-    for idx in top_indices:
-        p_len = periods[idx]
-        freq = freqs[idx]
-        amp = amplitudes[idx]
-        phase = phases[idx]
-        components.append({
-            "period": round(float(p_len), 1),
-            "freq": float(freq),
-            "amp": float(amp),
-            "phase": float(phase)
-        })
+        # Least-Squares Fit für Amplitude und Phase
+        A_mat = np.column_stack([cos_basis, sin_basis])
+        coefs, _, _, _ = np.linalg.lstsq(A_mat, detrended, rcond=None)
         
-    return components, trend_line, poly, detrended
+        amp = np.sqrt(coefs[0]**2 + coefs[1]**2)
+        phase = np.arctan2(coefs[1], coefs[0])
+        
+        # Über gesamte Zeitspanne projizieren
+        fit_wave = amp * np.cos(w * x_full - phase)
+        label = f"Dominanter Hauptzyklus ({p:.1f} Bars)" if idx == 0 else f"Oberschwingung / Harmonische ({p:.1f} Bars)"
+        wave_details[label] = fit_wave
+        composite_wave += fit_wave
+        
+    trend_full = np.polyval(poly, x_full)
+    return composite_wave, trend_full, wave_details
 
 # ----------------- Hauptausführung -----------------
 with st.spinner(f"Lade Kursdaten für {selected_coin}..."):
@@ -147,84 +170,59 @@ if df_raw is None or len(df_raw) < lookback_bars:
     st.error("Nicht genügend Kurshistorie verfügbar.")
     st.stop()
 
-# Analysefenster auswählen
 df_analysis = df_raw.iloc[-lookback_bars:].copy()
 prices = df_analysis['Close'].values
 N = len(prices)
 
-components, hist_trend, poly, detrended = analyze_cycles(prices, min_cycle, max_cycle, num_cycles)
+# 1. Ehlers Dominant Cycle ermitteln
+dom_period, confidence, all_periods, all_corrs = ehlers_autocorrelation_periodogram(prices, min_period, max_period)
 
-if not components:
-    st.warning("Im gewählten Frequenzband konnten keine signifikanten Zyklen identifiziert werden.")
-    st.stop()
+# 2. Zyklische Summenkurve berechnen
+composite_wave, trend_full, wave_details = fit_cyclical_model(prices, dom_period, forecast_bars)
 
-# ----------------- Zukunft & Summenkurve berechnen -----------------
-total_len = N + forecast_bars
-x_full = np.arange(total_len)
-
-# Zukünftige Zeitstempel generieren
 time_step = df_analysis.index[-1] - df_analysis.index[-2]
 future_times = [df_analysis.index[-1] + time_step * (k + 1) for k in range(forecast_bars)]
 all_times = list(df_analysis.index) + future_times
 
-# Trendlinie über Vergangenheit und Zukunft
-trend_full = np.polyval(poly, x_full)
-
-# Einzelne Sinuswellen und Summenwelle berechnen
-composite_wave = np.zeros(total_len)
-wave_dict = {}
-
-for c in components:
-    w = c["freq"] * 2 * np.pi
-    # Welle: y(t) = A * cos(w * t + phase)
-    single_wave = c["amp"] * np.cos(w * x_full + c["phase"])
-    wave_dict[f"Zyklus {c['period']} Bars (Stärke {c['amp']:.1f})"] = single_wave
-    composite_wave += single_wave
-
-# Finale Projektionskurve
 if include_trend:
     projected_price = trend_full + composite_wave
 else:
-    # Ohne Trend: um den letzten Kurs zentrieren
     last_price = prices[-1]
     projected_price = (composite_wave - composite_wave[N - 1]) + last_price
 
-# ----------------- Wendepunkte in der Zukunft finden -----------------
-future_comp = projected_price[N:]
-f_peaks, _ = find_peaks(future_comp)
-f_troughs, _ = find_peaks(-future_comp)
+# 3. Zukünftige Wendepunkte extrahieren
+future_curve = projected_price[N:]
+peaks, _ = find_peaks(future_curve)
+troughs, _ = find_peaks(-future_curve)
 
-turning_points = []
-for p in f_peaks:
-    tp_time = future_times[p]
-    turning_points.append({
+future_events = []
+for p in peaks:
+    future_events.append({
         "Typ": "▼ Zyklus-HOCH (Top)",
-        "Zeitpunkt": tp_time.strftime("%d.%m.%Y %H:%M"),
-        "Kerzen in Zukunft": f"+{p + 1}"
+        "Zeitpunkt": future_times[p].strftime("%d.%m.%Y %H:%M"),
+        "In Zukunft": f"+{p + 1} Kerzen"
     })
-for t in f_troughs:
-    tp_time = future_times[t]
-    turning_points.append({
+for t in troughs:
+    future_events.append({
         "Typ": "▲ Zyklus-TIEF (Boden)",
-        "Zeitpunkt": tp_time.strftime("%d.%m.%Y %H:%M"),
-        "Kerzen in Zukunft": f"+{t + 1}"
+        "Zeitpunkt": future_times[t].strftime("%d.%m.%Y %H:%M"),
+        "In Zukunft": f"+{t + 1} Kerzen"
     })
 
-# ----------------- UI Dashboard -----------------
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Asset / Markt", f"{selected_coin} / {tf_choice}")
-col2.metric("Dominanter Zyklus #1", f"{components[0]['period']} Kerzen")
-col3.metric("Extrahierte Zyklen", f"{len(components)}")
-col4.metric("Projektionshorizont", f"+{forecast_bars} Kerzen")
+# ----------------- Dashboard Metriken -----------------
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Asset / Timeframe", f"{selected_coin} / {tf_choice}")
+c2.metric("🎯 Dominanter Zyklus (Ehlers)", f"{dom_period} Kerzen")
+c3.metric("Signalstärke / Konfidenz", f"{confidence:.1f} %")
+c4.metric("Projektion", f"+{forecast_bars} Kerzen")
 
 st.markdown("---")
 
 # Interaktiver Chart: Kurs + Summenkurve
-st.subheader("📈 Kursverlauf & Projizierte Hurst-Summenkurve")
+st.subheader("📈 Realkurs & Ehlers-Composite-Summenkurve")
 
 fig = go.Figure()
 
-# Reale Kerzenkurse (Vergangenheit)
 fig.add_trace(go.Scatter(
     x=df_analysis.index,
     y=df_analysis['Close'],
@@ -233,25 +231,22 @@ fig.add_trace(go.Scatter(
     line=dict(color='#d1d4dc', width=1.5)
 ))
 
-# Summenkurve Vergangenheit (Fit)
 fig.add_trace(go.Scatter(
     x=df_analysis.index,
     y=projected_price[:N],
     mode='lines',
-    name='Summenkurve (Historischer Fit)',
+    name='Zyklus-Fit (Historie)',
     line=dict(color='#3b82f6', width=2, dash='dot')
 ))
 
-# Summenkurve Zukunft (Projektion)
 fig.add_trace(go.Scatter(
     x=future_times,
     y=projected_price[N:],
     mode='lines',
-    name='🔮 Summenkurven-Projektion (Zukunft)',
+    name='🔮 Ehlers Zukunftsprojektion',
     line=dict(color='#089981', width=3)
 ))
 
-# Vertikale Trennlinie JETZT
 fig.add_vline(
     x=df_analysis.index[-1].timestamp() * 1000,
     line_width=1.5,
@@ -270,58 +265,57 @@ fig.add_annotation(
 
 fig.update_layout(
     template="plotly_dark",
-    height=550,
+    height=530,
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     margin=dict(l=20, r=20, t=40, b=20)
 )
 st.plotly_chart(fig, use_container_width=True)
 
-# Detail-Reiter: Einzelwellen, Wendepunkte und Spektrum
-tab1, tab2, tab3 = st.tabs(["🌊 Einzelne Zykluskomponenten", "🎯 Zukünftige Wendepunkte", "📊 Zyklus-Spektrum"])
+# Detail-Tabs
+tab1, tab2, tab3 = st.tabs(["📡 Ehlers Periodogramm (Spektrum)", "🎯 Zukünftige Wendepunkte", "🌊 Einzelkomponenten"])
 
 with tab1:
-    st.markdown("##### Isolierte Sinuswellen (Die Bausteine der Summenkurve)")
-    st.caption("Jeder Markt besteht nach Hurst aus der Überlagerung mehrerer unabhängiger Zyklen:")
+    st.markdown("##### Autokorrelations-Spektrum nach John Ehlers")
+    st.caption("Der höchste Peak markiert die Periode mit der stärksten zyklischen Selbstähnlichkeit im Markt:")
     
-    fig_waves = go.Figure()
-    for wave_name, wave_vals in wave_dict.items():
-        fig_waves.add_trace(go.Scatter(
-            x=all_times,
-            y=wave_vals,
-            mode='lines',
-            name=wave_name
-        ))
+    spec_df = pd.DataFrame({"Periode": all_periods, "Korrelation": all_corrs * 100.0})
     
-    fig_waves.add_vline(x=df_analysis.index[-1].timestamp() * 1000, line_dash="dash", line_color="#f23645")
-    fig_waves.update_layout(
+    fig_spec = go.Figure()
+    fig_spec.add_trace(go.Bar(
+        x=spec_df["Periode"],
+        y=spec_df["Korrelation"],
+        marker_color=["#089981" if p == dom_period else "#2a2e39" for p in spec_df["Periode"]],
+        name="Korrelation (%)"
+    ))
+    fig_spec.update_layout(
         template="plotly_dark",
-        height=400,
-        margin=dict(l=20, r=20, t=20, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        height=380,
+        xaxis_title="Zykluslänge (in Kerzen)",
+        yaxis_title="Autokorrelations-Stärke (%)",
+        margin=dict(l=20, r=20, t=20, b=20)
     )
-    st.plotly_chart(fig_waves, use_container_width=True)
+    st.plotly_chart(fig_spec, use_container_width=True)
 
 with tab2:
-    st.markdown("##### Errechnete Wendepunkte auf der Summenkurve")
-    st.caption("Zeitpunkte, an denen die überlagerten Zyklen gemeinsam ein Top oder Bottom ausbilden:")
-    if turning_points:
-        df_tp = pd.DataFrame(turning_points).sort_values(by="Kerzen in Zukunft")
-        st.dataframe(df_tp, use_container_width=True, hide_index=True)
+    st.markdown("##### Berechnete Wendepunkte der Projektionskurve")
+    st.caption("Exakte Zeitpunkte, an denen der dominante Zyklus Böden oder Hochs formt:")
+    if future_events:
+        df_ev = pd.DataFrame(future_events).sort_values(by="In Zukunft")
+        st.dataframe(df_ev, use_container_width=True, hide_index=True)
     else:
-        st.info("Im gewählten Vorhersagezeitraum wurden keine Extrempunkte erkannt.")
+        st.info("Im gewählten Projektionsbereich wurden keine Wendepunkte gefunden.")
 
 with tab3:
-    st.markdown("##### Rangliste der stärksten identifizierten Zyklen")
-    comp_df = pd.DataFrame(components)[["period", "amp"]].rename(columns={
-        "period": "Zykluslänge (Kerzen)",
-        "amp": "Amplitude / Stärke"
-    })
-    st.dataframe(
-        comp_df,
-        column_config={
-            "Zykluslänge (Kerzen)": st.column_config.NumberColumn(format="%.1f"),
-            "Amplitude / Stärke": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=float(comp_df["Amplitude / Stärke"].max() * 1.1))
-        },
-        use_container_width=True,
-        hide_index=True
+    st.markdown("##### Isolierte Schwingungen")
+    st.caption("Der dominante Ehlers-Zyklus und seine erste Harmonische separat dargestellt:")
+    fig_w = go.Figure()
+    for w_name, w_vals in wave_details.items():
+        fig_w.add_trace(go.Scatter(x=all_times, y=w_vals, mode='lines', name=w_name))
+    fig_w.add_vline(x=df_analysis.index[-1].timestamp() * 1000, line_dash="dash", line_color="#f23645")
+    fig_w.update_layout(
+        template="plotly_dark",
+        height=380,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=20, r=20, t=20, b=20)
     )
+    st.plotly_chart(fig_w, use_container_width=True)
