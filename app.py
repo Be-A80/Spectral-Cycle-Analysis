@@ -9,13 +9,13 @@ import time
 
 # ----------------- Seiten-Konfiguration -----------------
 st.set_page_config(
-    page_title="Hurst-Ehlers Pro + Multi-Scanner",
+    page_title="Hurst-Ehlers Pro + Treiber-Analyse",
     page_icon="🤖",
     layout="wide"
 )
 
-st.title("🤖 Self-Calibrating Hurst-Ehlers & Multi-Coin Scanner")
-st.caption("Kalibriert Zyklusmodelle automatisch im Walk-Forward-Backtest und scannt den gesamten Markt nach der höchsten Prognosegüte.")
+st.title("🤖 Self-Calibrating Hurst-Ehlers & Zyklus-Treiber-Analyse")
+st.caption("Mit Walk-Forward Auto-Optimizer, Multi-Coin-Scanner und detaillierter Phasen-/Treiber-Aufschlüsselung für jeden Wendepunkt.")
 
 # US-kompatible Datenquelle (Kraken)
 @st.cache_resource
@@ -208,6 +208,7 @@ def fit_high_precision_model(prices, cycle_periods, forecast_n, weight_strength,
     
     composite_wave = np.zeros(total_len)
     wave_dict = {}
+    wave_specs = []
     
     for idx, p in enumerate(cycle_periods):
         c_cos = coefs[2 * idx]
@@ -226,6 +227,14 @@ def fit_high_precision_model(prices, cycle_periods, forecast_n, weight_strength,
         wave_dict[label] = wave_full
         composite_wave += wave_full
         
+        wave_specs.append({
+            "period": float(p),
+            "amp": amp,
+            "phase": phase,
+            "w": float(w),
+            "label": f"{int(round(p))}b"
+        })
+        
     projected_price = trend_full + composite_wave
     
     if anchor_last:
@@ -238,9 +247,68 @@ def fit_high_precision_model(prices, cycle_periods, forecast_n, weight_strength,
     corr_matrix = np.corrcoef(prices[-recent_len:], projected_price[N - recent_len : N])
     fit_r2 = corr_matrix[0, 1] * 100.0
     
-    return projected_price, wave_dict, max(0.0, float(fit_r2))
+    return projected_price, wave_dict, max(0.0, float(fit_r2)), wave_specs
 
-# ----------------- 3. Walk-Forward Grid-Search Auto-Optimizer -----------------
+# ----------------- 3. Treiber- & Synchronisations-Analyse je Wendepunkt -----------------
+def analyze_turning_point_drivers(bar_idx_full, is_peak, wave_specs):
+    """
+    Prüft für einen prognostizierten Wendepunkt (Index bar_idx_full), welche Einzelwellen
+    synchron in dieselbe Richtung drücken und welche Welle die stärkste Krümmung erzeugt.
+    """
+    sync_waves = []
+    opposing_waves = []
+    best_trigger_label = "—"
+    max_curvature = -1.0
+    
+    aligned_energy = 0.0
+    total_energy = 0.0
+    
+    for spec in wave_specs:
+        p = spec["period"]
+        amp = spec["amp"]
+        w = spec["w"]
+        phase = spec["phase"]
+        
+        # Phasenwinkel an diesem Bar: cos_val = +1 (exaktes Wellen-Hoch), -1 (exaktes Wellen-Tief)
+        angle = w * bar_idx_full - phase
+        cos_val = float(np.cos(angle))
+        
+        # Richtungskorrekte Ausrichtung: +1 = perfekt in Richtung des Wendepunkts, -1 = genau entgegengesetzt
+        alignment = cos_val if is_peak else -cos_val
+        
+        # Physikalische Krümmungskraft (2. Ableitung ~ A * w^2)
+        curvature_force = amp * (w ** 2)
+        
+        total_energy += amp
+        if alignment > 0:
+            aligned_energy += amp * alignment
+            if alignment * curvature_force > max_curvature:
+                max_curvature = alignment * curvature_force
+                best_trigger_label = f"Zyklus {int(round(p))} Bars ({int(round(alignment * 100))}% Phase)"
+                
+        # Ab >= 50% Phasen-Übereinstimmung (Winkel <= 60 Grad vom Scheitelpunkt) gilt die Welle als aktiver Treiber
+        if alignment >= 0.5:
+            pct_align = int(round(alignment * 100))
+            sync_waves.append((alignment * amp, f"{int(round(p))} Bars ({pct_align}%)"))
+        elif alignment <= -0.4:
+            opposing_waves.append(f"{int(round(p))}b")
+            
+    sync_waves.sort(key=lambda x: x[0], reverse=True)
+    sync_str = ", ".join([item[1] for item in sync_waves]) if sync_waves else "Nur schwache Teilwellen"
+    opp_str = ", ".join(opposing_waves) if opposing_waves else "Keine (Freie Bahn)"
+    
+    sync_score = round((aligned_energy / total_energy) * 100.0, 1) if total_energy > 0 else 0.0
+    sync_count_str = f"{len(sync_waves)} / {len(wave_specs)} Wellen"
+    
+    return {
+        "sync_count": sync_count_str,
+        "sync_score": sync_score,
+        "trigger": best_trigger_label,
+        "drivers": sync_str,
+        "opposing": opp_str
+    }
+
+# ----------------- 4. Walk-Forward Grid-Search Auto-Optimizer -----------------
 def run_walk_forward_optimizer(bt_train, bt_actual, all_bt_peaks, shift_n, anchor_last):
     cycle_counts = [2, 3, 4, 5, 6, 7]
     wls_focus_list = [0.5, 1.5, 2.5, 3.5, 4.5]
@@ -253,7 +321,7 @@ def run_walk_forward_optimizer(bt_train, bt_actual, all_bt_peaks, shift_n, ancho
         sub_periods = all_bt_peaks[:n_comp]
         for w_foc in wls_focus_list:
             for p_deg in poly_degrees:
-                proj_full, _, _ = fit_high_precision_model(
+                proj_full, _, _, _ = fit_high_precision_model(
                     bt_train, sub_periods, shift_n, w_foc, p_deg, anchor_last
                 )
                 fc_curve = proj_full[len(bt_train):]
@@ -282,7 +350,7 @@ def run_walk_forward_optimizer(bt_train, bt_actual, all_bt_peaks, shift_n, ancho
     return best_row, res_df
 
 # ----------------- Einzel-Asset Hauptausführung -----------------
-with st.spinner(f"Berechne Zyklusmodell für {selected_coin}..."):
+with st.spinner(f"Berechne Zyklusmodell und Treiber-Analyse für {selected_coin}..."):
     df_raw = fetch_candles(selected_coin, tf_choice)
 
 min_required = lookback_bars + backtest_shift + 10
@@ -313,7 +381,7 @@ else:
     active_trend_deg = int(trend_degree_manual)
 
 bt_active_p = bt_all_peaks[:active_num_comp]
-bt_proj_full, _, _ = fit_high_precision_model(
+bt_proj_full, _, _, _ = fit_high_precision_model(
     bt_prices_train, bt_active_p, backtest_shift, active_wls_focus, active_trend_deg, anchor_to_last
 )
 bt_forecast_curve = bt_proj_full[len(bt_prices_train):]
@@ -335,7 +403,7 @@ dom_period, dom_conf, all_live_peaks, spec_periods, spec_scores = ehlers_multi_p
 )
 active_periods = all_live_peaks[:active_num_comp]
 
-projected_price, wave_dict, recent_fit_quality = fit_high_precision_model(
+projected_price, wave_dict, recent_fit_quality, live_wave_specs = fit_high_precision_model(
     prices, active_periods, forecast_bars, active_wls_focus, active_trend_deg, anchor_to_last
 )
 
@@ -343,24 +411,38 @@ time_step = df_analysis.index[-1] - df_analysis.index[-2]
 future_times = [df_analysis.index[-1] + time_step * (k + 1) for k in range(forecast_bars)]
 all_times = list(df_analysis.index) + future_times
 
+# Zukünftige Wendepunkte inkl. Treiber-Analyse berechnen
 future_curve = projected_price[N:]
 peaks, _ = find_peaks(future_curve, distance=2)
 troughs, _ = find_peaks(-future_curve, distance=2)
 
 turning_points = []
 for p in peaks:
+    drv = analyze_turning_point_drivers(N + p, is_peak=True, wave_specs=live_wave_specs)
     turning_points.append({
         "Typ": "▼ Zyklus-HOCH (Top)",
         "Zeitpunkt": future_times[p].strftime("%d.%m.%Y %H:%M"),
-        "Kerzen entfernt": int(p + 1),
-        "Anzeige": f"+{p + 1} Kerzen"
+        "In Zukunft": f"+{p + 1} Bars",
+        "Synchrone Wellen": drv["sync_count"],
+        "Cluster-Stärke (%)": drv["sync_score"],
+        "Haupt-Trigger (Krümmung)": drv["trigger"],
+        "Beteiligte Zyklus-Treiber (Phase)": drv["drivers"],
+        "Gegenläufige Wellen": drv["opposing"],
+        "Kerzen entfernt": int(p + 1)
     })
+
 for t in troughs:
+    drv = analyze_turning_point_drivers(N + t, is_peak=False, wave_specs=live_wave_specs)
     turning_points.append({
         "Typ": "▲ Zyklus-TIEF (Boden)",
         "Zeitpunkt": future_times[t].strftime("%d.%m.%Y %H:%M"),
-        "Kerzen entfernt": int(t + 1),
-        "Anzeige": f"+{t + 1} Kerzen"
+        "In Zukunft": f"+{t + 1} Bars",
+        "Synchrone Wellen": drv["sync_count"],
+        "Cluster-Stärke (%)": drv["sync_score"],
+        "Haupt-Trigger (Krümmung)": drv["trigger"],
+        "Beteiligte Zyklus-Treiber (Phase)": drv["drivers"],
+        "Gegenläufige Wellen": drv["opposing"],
+        "Kerzen entfernt": int(t + 1)
     })
 
 bt_pred_peaks, _ = find_peaks(bt_forecast_curve, distance=2)
@@ -497,15 +579,47 @@ fig.update_layout(
 )
 st.plotly_chart(fig, use_container_width=True)
 
-# ----------------- Detail-Tabs inkl. Multi-Coin-Scanner -----------------
-tab_scan, tab_opt, tab_bt, tab1, tab2, tab3 = st.tabs([
-    "🌐 Multi-Coin Scanner (Markt-Ranking)",
+# ----------------- Detail-Tabs -----------------
+tab1, tab_scan, tab_opt, tab_bt, tab2, tab3 = st.tabs([
+    "🎯 Zukünftige Wendepunkte (Treiber-Analyse)",
+    "🌐 Multi-Coin Scanner",
     "🏆 Auto-Optimizer Ranking",
     "⏪ Backtest-Auswertung",
-    "🎯 Zukünftige Wendepunkte",
     "🌊 Einzelne Zykluskomponenten",
     "📡 Ehlers Spektrum"
 ])
+
+with tab1:
+    st.markdown(f"##### 🎯 Zukünftige Wendepunkte & Synchronisations-Treiber ({selected_coin})")
+    st.caption(
+        "Zeigt für jedes prognostizierte Hoch und Tief genau an, **welche einzelnen Zykluswellen** dort gleichzeitig ihren Scheitelpunkt erreichen "
+        "und wie stark die kombinierte Cluster-Energie ist:"
+    )
+    if turning_points:
+        df_tp = pd.DataFrame(turning_points).sort_values(by="Kerzen entfernt")
+        df_tp = df_tp.drop(columns=["Kerzen entfernt"])
+        st.dataframe(
+            df_tp,
+            column_config={
+                "Cluster-Stärke (%)": st.column_config.ProgressColumn(
+                    "Cluster-Synchronisation",
+                    help="Anteil der gesamten Zyklus-Energie, die an diesem Punkt in dieselbe Wenderichtung drückt.",
+                    format="%.1f %%",
+                    min_value=0,
+                    max_value=100
+                ),
+                "Haupt-Trigger (Krümmung)": st.column_config.TextColumn(
+                    "Haupt-Trigger (Stärkster Impuls)"
+                ),
+                "Beteiligte Zyklus-Treiber (Phase)": st.column_config.TextColumn(
+                    "Synchrone Treiber-Wellen (Phasen-Nähe)"
+                )
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("Keine klaren Wendepunkte im gewählten Horizont erkannt.")
 
 with tab_scan:
     st.markdown(f"##### 🌐 Multi-Coin Walk-Forward Scanner ({tf_choice})")
@@ -541,7 +655,6 @@ with tab_scan:
                         c_bt_train, c_bt_actual, c_bt_peaks, backtest_shift, anchor_to_last
                     )
                     
-                    # Live-Prognose mit dem Gewinner-Setup des Coins berechnen
                     c_live_df = df_c.iloc[-lookback_bars:]
                     c_live_prices = c_live_df['Close'].values
                     c_dom_p, c_conf, c_live_peaks, _, _ = ehlers_multi_peak_spectrum(
@@ -552,7 +665,7 @@ with tab_scan:
                     opt_w = float(best_c_row["WLS-Fokus"])
                     opt_d = int(best_c_row["Trend-Grad"])
                     
-                    c_proj, _, _ = fit_high_precision_model(
+                    c_proj, _, _, c_specs = fit_high_precision_model(
                         c_live_prices, c_live_peaks[:opt_n], forecast_bars, opt_w, opt_d, anchor_to_last
                     )
                     
@@ -565,9 +678,17 @@ with tab_scan:
                     
                     next_events = []
                     for p_i in c_pk:
-                        next_events.append((int(p_i + 1), f"▼ TOP in +{p_i+1} Bars ({c_ftimes[p_i].strftime('%d.%m. %H:%M')})"))
+                        drv_i = analyze_turning_point_drivers(len(c_live_prices) + p_i, True, c_specs)
+                        next_events.append((
+                            int(p_i + 1),
+                            f"▼ TOP in +{p_i+1}b ({c_ftimes[p_i].strftime('%d.%m.')}) | Sync: {drv_i['sync_score']}%"
+                        ))
                     for t_i in c_tr:
-                        next_events.append((int(t_i + 1), f"▲ BODEN in +{t_i+1} Bars ({c_ftimes[t_i].strftime('%d.%m. %H:%M')})"))
+                        drv_i = analyze_turning_point_drivers(len(c_live_prices) + t_i, False, c_specs)
+                        next_events.append((
+                            int(t_i + 1),
+                            f"▲ BODEN in +{t_i+1}b ({c_ftimes[t_i].strftime('%d.%m.')}) | Sync: {drv_i['sync_score']}%"
+                        ))
                         
                     next_events.sort(key=lambda x: x[0])
                     next_turn_str = next_events[0][1] if next_events else "—"
@@ -581,7 +702,7 @@ with tab_scan:
                         "Korrelation (%)": float(best_c_row["Korrelation (%)"]),
                         "Dom. Zyklus": f"{c_dom_p} Bars",
                         "Opt. Setup": f"{opt_n} Zyk. | WLS {opt_w}",
-                        "Nächster Zyklus-Wendepunkt": next_turn_str,
+                        "Nächster Wendepunkt & Sync": next_turn_str,
                         "TradingView": tv_link
                     })
             except Exception:
@@ -664,15 +785,6 @@ with tab_bt:
             st.dataframe(pd.DataFrame(bt_eval_rows), use_container_width=True, hide_index=True)
         else:
             st.info("Im gewählten Backtest-Fenster lagen keine ausgeprägten Zyklus-Wendepunkte.")
-
-with tab1:
-    st.markdown(f"##### Chronologische Liste der nächsten Zyklus-Wendepunkte ({selected_coin})")
-    if turning_points:
-        df_tp = pd.DataFrame(turning_points).sort_values(by="Kerzen entfernt")
-        df_tp = df_tp.drop(columns=["Kerzen entfernt"])
-        st.dataframe(df_tp, use_container_width=True, hide_index=True)
-    else:
-        st.info("Keine klaren Wendepunkte im gewählten Horizont erkannt.")
 
 with tab2:
     st.markdown("##### Isolierte Zykluswellen (Simultanes WLS-Fitting)")
