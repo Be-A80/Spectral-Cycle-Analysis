@@ -5,16 +5,17 @@ import ccxt
 import plotly.graph_objects as go
 from scipy.signal import find_peaks
 from datetime import datetime, timezone
+import time
 
 # ----------------- Seiten-Konfiguration -----------------
 st.set_page_config(
-    page_title="Hurst-Ehlers + Walk-Forward Backtest",
-    page_icon="🎯",
+    page_title="Hurst-Ehlers Pro + Multi-Scanner",
+    page_icon="🤖",
     layout="wide"
 )
 
-st.title("🎯 High-Precision Hurst-Ehlers & Walk-Forward Backtester")
-st.caption("Inklusive Out-of-Sample Backtesting: Prüfe live, wie präzise die Vorhersage vor X Kerzen tatsächlich eingetroffen ist.")
+st.title("🤖 Self-Calibrating Hurst-Ehlers & Multi-Coin Scanner")
+st.caption("Kalibriert Zyklusmodelle automatisch im Walk-Forward-Backtest und scannt den gesamten Markt nach der höchsten Prognosegüte.")
 
 # US-kompatible Datenquelle (Kraken)
 @st.cache_resource
@@ -24,22 +25,27 @@ def get_exchange():
 exchange = get_exchange()
 
 TF_CONFIG = {
-    "15m": {"fetch_tf": "15m", "resample": None, "limit": 720},
-    "1h":  {"fetch_tf": "1h",  "resample": None, "limit": 720},
-    "4h":  {"fetch_tf": "4h",  "resample": None, "limit": 720},
-    "1d":  {"fetch_tf": "1d",  "resample": None, "limit": 720},
-    "2d":  {"fetch_tf": "1d",  "resample": "2D", "limit": 720},
-    "3d":  {"fetch_tf": "1d",  "resample": "3D", "limit": 720},
-    "4d":  {"fetch_tf": "1d",  "resample": "4D", "limit": 720},
-    "8d":  {"fetch_tf": "1d",  "resample": "8D", "limit": 720},
-    "1w":  {"fetch_tf": "1w",  "resample": None, "limit": 500}
+    "15m": {"fetch_tf": "15m", "resample": None, "limit": 720, "tv": "15"},
+    "1h":  {"fetch_tf": "1h",  "resample": None, "limit": 720, "tv": "60"},
+    "4h":  {"fetch_tf": "4h",  "resample": None, "limit": 720, "tv": "240"},
+    "1d":  {"fetch_tf": "1d",  "resample": None, "limit": 720, "tv": "D"},
+    "2d":  {"fetch_tf": "1d",  "resample": "2D", "limit": 720, "tv": "2D"},
+    "3d":  {"fetch_tf": "1d",  "resample": "3D", "limit": 720, "tv": "3D"},
+    "4d":  {"fetch_tf": "1d",  "resample": "4D", "limit": 720, "tv": "4D"},
+    "8d":  {"fetch_tf": "1d",  "resample": "8D", "limit": 720, "tv": "8D"},
+    "1w":  {"fetch_tf": "1w",  "resample": None, "limit": 500, "tv": "W"}
 }
+
+ALL_COINS = [
+    "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "AVAX", "DOT", "LINK", "NEAR",
+    "SUI", "APT", "LTC", "BCH", "UNI", "ATOM", "ARB", "OP", "FIL", "INJ",
+    "TIA", "RUNE", "AAVE", "SEI", "RENDER", "ICP", "PEPE"
+]
 
 # ----------------- Sidebar / Parameter -----------------
 with st.sidebar:
     st.header("⚙️ Markt & Zeiteinheit")
-    market_list = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "AVAX", "DOT", "LINK", "NEAR"]
-    selected_coin = st.selectbox("Markt / Asset", options=market_list, index=0)
+    selected_coin = st.selectbox("Einzel-Analyse Asset", options=ALL_COINS, index=0)
     
     tf_options = list(TF_CONFIG.keys())
     tf_choice = st.selectbox("Timeframe", options=tf_options, index=tf_options.index("1d"))
@@ -49,38 +55,49 @@ with st.sidebar:
     )
     
     st.markdown("---")
-    st.subheader("⏪ Walk-Forward Backtest")
-    enable_backtest = st.checkbox("Walk-Forward-Modus im Hauptchart einblenden", value=True)
+    st.subheader("🤖 Auto-Optimizer & Backtest")
+    auto_optimize = st.checkbox(
+        "⚡ Auto-Optimizer aktivieren",
+        value=True,
+        help="Testet automatisch alle Kombinationen aus Zyklenanzahl, WLS-Fokus und Trendgrad im Backtest und wählt das beste Setup."
+    )
+    enable_backtest = st.checkbox("Walk-Forward-Kurve im Chart zeigen", value=True)
     backtest_shift = st.slider(
-        "Zeitreise: Vor X Kerzen berechnen",
-        min_value=10, max_value=80, value=25, step=5,
-        help="Schneidet die letzten X Kerzen ab und berechnet die Prognose so, als wärst du damals live im Markt gewesen."
+        "Backtest-Fenster (Vor X Kerzen)",
+        min_value=10, max_value=60, value=20, step=5
     )
     
     st.markdown("---")
-    st.subheader("🎯 Präzisions-Tuning")
-    recency_focus = st.slider(
-        "Gegenwarts-Fokus (WLS-Gewichtung)", 
-        min_value=0.0, max_value=5.0, value=2.5, step=0.5
+    st.subheader("🎯 Manuelle Parameter (falls Auto aus)")
+    recency_focus_manual = st.slider(
+        "Gegenwarts-Fokus (WLS)", 
+        min_value=0.0, max_value=5.0, value=2.5, step=0.5,
+        disabled=auto_optimize
     )
-    trend_degree = st.selectbox(
+    trend_degree_manual = st.selectbox(
         "Basis-Trend Modell", 
         options=[1, 2, 3], 
         index=1,
-        format_func=lambda x: "Linear (Gerade)" if x == 1 else f"Adaptives Polynom ({x}. Grades)"
+        format_func=lambda x: "Linear (Gerade)" if x == 1 else f"Polynom ({x}. Grades)",
+        disabled=auto_optimize
+    )
+    num_components_manual = st.slider(
+        "Anzahl kombinierter Zyklen",
+        min_value=2, max_value=8, value=4, step=1,
+        disabled=auto_optimize
     )
     anchor_to_last = st.checkbox("Projektion am Startkurs verankern", value=True)
     
     st.markdown("---")
-    st.subheader("📡 Ehlers & Hurst Parameter")
+    st.subheader("📡 Ehlers & Horizont")
     min_period = st.number_input("Min. Zykluslänge (Kerzen)", min_value=4, max_value=30, value=7, step=1)
     max_period = st.number_input("Max. Zykluslänge (Kerzen)", min_value=25, max_value=150, value=85, step=5)
-    num_components = st.slider("Anzahl kombinierter Zyklen", min_value=2, max_value=8, value=4, step=1)
     forecast_bars = st.slider("Zukunfts-Projektion (Kerzen)", min_value=10, max_value=100, value=30, step=5)
     
-    st.button("🔄 Neu berechnen", use_container_width=True)
+    st.button("🔄 Einzel-Analyse aktualisieren", use_container_width=True)
 
 # ----------------- Daten abrufen -----------------
+@st.cache_data(ttl=180)
 def fetch_candles(coin, tf_key):
     cfg = TF_CONFIG[tf_key]
     symbol = f"{coin}/USD"
@@ -105,7 +122,7 @@ def fetch_candles(coin, tf_key):
     return df
 
 # ----------------- 1. Multi-Peak Ehlers Spektralanalyse -----------------
-def ehlers_multi_peak_spectrum(prices, min_p, max_p, num_comp):
+def ehlers_multi_peak_spectrum(prices, min_p, max_p, max_comp=8):
     detrended = np.diff(np.log(prices))
     n = len(detrended)
     
@@ -136,22 +153,22 @@ def ehlers_multi_peak_spectrum(prices, min_p, max_p, num_comp):
     
     if len(peaks) > 0:
         sorted_peaks = peaks[np.argsort(score_arr[peaks])[::-1]]
-        selected_p = [float(periods[idx]) for idx in sorted_peaks[:num_comp]]
+        candidate_p = [float(periods[idx]) for idx in sorted_peaks[:max_comp]]
     else:
         best_idx = int(np.argmax(score_arr))
-        selected_p = [float(periods[best_idx])]
+        candidate_p = [float(periods[best_idx])]
         
-    dom_period = int(selected_p[0])
+    dom_period = int(candidate_p[0])
     dom_conf = float(np.max(score_arr)) * 100.0 if len(score_arr) > 0 else 0.0
     
-    while len(selected_p) < num_comp:
-        candidate = max(4.0, round(selected_p[0] / (len(selected_p) + 1), 1))
-        if candidate not in selected_p:
-            selected_p.append(candidate)
+    while len(candidate_p) < max_comp:
+        harm = max(4.0, round(candidate_p[0] / (len(candidate_p) + 1), 1))
+        if harm not in candidate_p:
+            candidate_p.append(harm)
         else:
-            break
+            candidate_p.append(max(4.0, candidate_p[-1] * 0.75))
             
-    return dom_period, dom_conf, selected_p, periods, score_arr
+    return dom_period, dom_conf, candidate_p, periods, score_arr
 
 # ----------------- 2. Gewichtetes Simultanes Fitting (WLS) -----------------
 def fit_high_precision_model(prices, cycle_periods, forecast_n, weight_strength, poly_deg, anchor_last):
@@ -223,33 +240,109 @@ def fit_high_precision_model(prices, cycle_periods, forecast_n, weight_strength,
     
     return projected_price, wave_dict, max(0.0, float(fit_r2))
 
-# ----------------- Hauptausführung -----------------
-with st.spinner(f"Lade Kursdaten und berechne Zyklusmodell für {selected_coin}..."):
+# ----------------- 3. Walk-Forward Grid-Search Auto-Optimizer -----------------
+def run_walk_forward_optimizer(bt_train, bt_actual, all_bt_peaks, shift_n, anchor_last):
+    cycle_counts = [2, 3, 4, 5, 6, 7]
+    wls_focus_list = [0.5, 1.5, 2.5, 3.5, 4.5]
+    poly_degrees = [1, 2]
+    
+    actual_diff = np.sign(np.diff(bt_actual))
+    results = []
+    
+    for n_comp in cycle_counts:
+        sub_periods = all_bt_peaks[:n_comp]
+        for w_foc in wls_focus_list:
+            for p_deg in poly_degrees:
+                proj_full, _, _ = fit_high_precision_model(
+                    bt_train, sub_periods, shift_n, w_foc, p_deg, anchor_last
+                )
+                fc_curve = proj_full[len(bt_train):]
+                
+                corr = 0.0
+                if np.std(bt_actual) > 1e-8 and np.std(fc_curve) > 1e-8:
+                    corr = float(np.corrcoef(bt_actual, fc_curve)[0, 1]) * 100.0
+                
+                pred_diff = np.sign(np.diff(fc_curve))
+                dir_acc = float(np.mean(actual_diff == pred_diff)) * 100.0
+                
+                combined_score = 0.5 * dir_acc + 0.5 * max(0.0, corr)
+                
+                results.append({
+                    "Zyklen": n_comp,
+                    "WLS-Fokus": w_foc,
+                    "Trend-Grad": p_deg,
+                    "Trend-Typ": "Linear (1)" if p_deg == 1 else "Polynom (2)",
+                    "Richtung (%)": round(dir_acc, 1),
+                    "Korrelation (%)": round(corr, 1),
+                    "Gesamt-Score": round(combined_score, 1)
+                })
+                
+    res_df = pd.DataFrame(results).sort_values(by="Gesamt-Score", ascending=False).reset_index(drop=True)
+    best_row = res_df.iloc[0]
+    return best_row, res_df
+
+# ----------------- Einzel-Asset Hauptausführung -----------------
+with st.spinner(f"Berechne Zyklusmodell für {selected_coin}..."):
     df_raw = fetch_candles(selected_coin, tf_choice)
 
 min_required = lookback_bars + backtest_shift + 10
 if df_raw is None or len(df_raw) < min_required:
-    st.error("Nicht genügend Kurshistorie für diesen Analyse- und Backtest-Zeitraum verfügbar. Bitte Analysebereich leicht reduzieren.")
+    st.error("Nicht genügend Kurshistorie für diesen Analyse- und Backtest-Zeitraum verfügbar.")
     st.stop()
 
-# A) Aktuelle Live-Analyse (Gegenwart -> Zukunft)
+df_bt_train = df_raw.iloc[-(lookback_bars + backtest_shift) : -backtest_shift].copy()
+df_bt_actual = df_raw.iloc[-backtest_shift:].copy()
+bt_prices_train = df_bt_train['Close'].values
+bt_prices_actual = df_bt_actual['Close'].values
+
+bt_dom_p, _, bt_all_peaks, _, _ = ehlers_multi_peak_spectrum(
+    bt_prices_train, min_period, max_period, max_comp=8
+)
+
+opt_df = None
+if auto_optimize:
+    best_cfg, opt_df = run_walk_forward_optimizer(
+        bt_prices_train, bt_prices_actual, bt_all_peaks, backtest_shift, anchor_to_last
+    )
+    active_num_comp = int(best_cfg["Zyklen"])
+    active_wls_focus = float(best_cfg["WLS-Fokus"])
+    active_trend_deg = int(best_cfg["Trend-Grad"])
+else:
+    active_num_comp = int(num_components_manual)
+    active_wls_focus = float(recency_focus_manual)
+    active_trend_deg = int(trend_degree_manual)
+
+bt_active_p = bt_all_peaks[:active_num_comp]
+bt_proj_full, _, _ = fit_high_precision_model(
+    bt_prices_train, bt_active_p, backtest_shift, active_wls_focus, active_trend_deg, anchor_to_last
+)
+bt_forecast_curve = bt_proj_full[len(bt_prices_train):]
+
+bt_corr = 0.0
+if np.std(bt_prices_actual) > 1e-8 and np.std(bt_forecast_curve) > 1e-8:
+    bt_corr = float(np.corrcoef(bt_prices_actual, bt_forecast_curve)[0, 1]) * 100.0
+
+actual_diff = np.sign(np.diff(bt_prices_actual))
+pred_diff = np.sign(np.diff(bt_forecast_curve))
+dir_accuracy = float(np.mean(actual_diff == pred_diff)) * 100.0
+
 df_analysis = df_raw.iloc[-lookback_bars:].copy()
 prices = df_analysis['Close'].values
 N = len(prices)
 
-dom_period, dom_conf, active_periods, spec_periods, spec_scores = ehlers_multi_peak_spectrum(
-    prices, min_period, max_period, num_components
+dom_period, dom_conf, all_live_peaks, spec_periods, spec_scores = ehlers_multi_peak_spectrum(
+    prices, min_period, max_period, max_comp=8
 )
+active_periods = all_live_peaks[:active_num_comp]
 
 projected_price, wave_dict, recent_fit_quality = fit_high_precision_model(
-    prices, active_periods, forecast_bars, recency_focus, trend_degree, anchor_to_last
+    prices, active_periods, forecast_bars, active_wls_focus, active_trend_deg, anchor_to_last
 )
 
 time_step = df_analysis.index[-1] - df_analysis.index[-2]
 future_times = [df_analysis.index[-1] + time_step * (k + 1) for k in range(forecast_bars)]
 all_times = list(df_analysis.index) + future_times
 
-# Zukünftige Wendepunkte (Live)
 future_curve = projected_price[N:]
 peaks, _ = find_peaks(future_curve, distance=2)
 troughs, _ = find_peaks(-future_curve, distance=2)
@@ -270,33 +363,6 @@ for t in troughs:
         "Anzeige": f"+{t + 1} Kerzen"
     })
 
-# B) Walk-Forward Backtest (Vergangenheit vor X Kerzen -> bis Heute)
-df_bt_train = df_raw.iloc[-(lookback_bars + backtest_shift) : -backtest_shift].copy()
-df_bt_actual = df_raw.iloc[-backtest_shift:].copy()
-bt_prices_train = df_bt_train['Close'].values
-bt_prices_actual = df_bt_actual['Close'].values
-
-bt_dom_p, _, bt_active_p, _, _ = ehlers_multi_peak_spectrum(
-    bt_prices_train, min_period, max_period, num_components
-)
-
-bt_proj_full, _, _ = fit_high_precision_model(
-    bt_prices_train, bt_active_p, backtest_shift, recency_focus, trend_degree, anchor_to_last
-)
-
-bt_forecast_curve = bt_proj_full[len(bt_prices_train):]
-
-# Out-of-Sample Metriken berechnen
-bt_corr = 0.0
-if np.std(bt_prices_actual) > 1e-8 and np.std(bt_forecast_curve) > 1e-8:
-    bt_corr = float(np.corrcoef(bt_prices_actual, bt_forecast_curve)[0, 1]) * 100.0
-
-# Richtungs-Trefferquote (Directional Accuracy / Steigung von Kerze zu Kerze)
-actual_diff = np.sign(np.diff(bt_prices_actual))
-pred_diff = np.sign(np.diff(bt_forecast_curve))
-dir_accuracy = float(np.mean(actual_diff == pred_diff)) * 100.0
-
-# Wendepunkt-Evaluation im Backtest-Fenster
 bt_pred_peaks, _ = find_peaks(bt_forecast_curve, distance=2)
 bt_pred_troughs, _ = find_peaks(-bt_forecast_curve, distance=2)
 bt_real_peaks, _ = find_peaks(bt_prices_actual, distance=2)
@@ -304,16 +370,14 @@ bt_real_troughs, _ = find_peaks(-bt_prices_actual, distance=2)
 
 bt_eval_rows = []
 for p in bt_pred_peaks:
-    # Prüfe, ob ein reales Hoch innerhalb von ±2 Kerzen lag
     diffs = np.abs(bt_real_peaks - p) if len(bt_real_peaks) > 0 else np.array([999])
     min_dist = int(np.min(diffs))
     if min_dist == 0:
-        hit_str = "✅ Exakter Volltreffer (0 Bars Abweichung)"
+        hit_str = "✅ Exakter Volltreffer (0 Bars)"
     elif min_dist <= 2:
-        hit_str = f"✅ Treffer im Toleranzfenster (±{min_dist} Bar)"
+        hit_str = f"✅ Treffer in Toleranz (±{min_dist} Bar)"
     else:
         hit_str = f"❌ Abweichung ({min_dist} Bars)" if min_dist < 100 else "❌ Kein lokales Hoch"
-        
     bt_eval_rows.append({
         "Prognostizierter Typ": "▼ Zyklus-HOCH (Top)",
         "Prognose-Datum": df_bt_actual.index[p].strftime("%d.%m.%Y %H:%M"),
@@ -324,25 +388,32 @@ for t in bt_pred_troughs:
     diffs = np.abs(bt_real_troughs - t) if len(bt_real_troughs) > 0 else np.array([999])
     min_dist = int(np.min(diffs))
     if min_dist == 0:
-        hit_str = "✅ Exakter Volltreffer (0 Bars Abweichung)"
+        hit_str = "✅ Exakter Volltreffer (0 Bars)"
     elif min_dist <= 2:
-        hit_str = f"✅ Treffer im Toleranzfenster (±{min_dist} Bar)"
+        hit_str = f"✅ Treffer in Toleranz (±{min_dist} Bar)"
     else:
         hit_str = f"❌ Abweichung ({min_dist} Bars)" if min_dist < 100 else "❌ Kein lokales Tief"
-        
     bt_eval_rows.append({
         "Prognostizierter Typ": "▲ Zyklus-TIEF (Boden)",
         "Prognose-Datum": df_bt_actual.index[t].strftime("%d.%m.%Y %H:%M"),
         "Ergebnis im echten Markt": hit_str
     })
 
-# ----------------- Dashboard Metriken -----------------
+# ----------------- Banner & Metriken -----------------
+if auto_optimize:
+    trend_name = "Linear (Grad 1)" if active_trend_deg == 1 else "Polynom (Grad 2)"
+    st.success(
+        f"🤖 **Auto-Optimizer ({selected_coin}):** Beste Walk-Forward-Genauigkeit mit **{active_num_comp} Zyklen**, "
+        f"**WLS-Fokus {active_wls_focus}** und **{trend_name}** "
+        f"(Richtungs-Trefferquote: **{dir_accuracy:.1f}%**, Korrelation: **{bt_corr:.1f}%**)."
+    )
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Asset / Timeframe", f"{selected_coin} / {tf_choice}")
-c2.metric("🎯 Dominanter Zyklus (Live)", f"{dom_period} Kerzen", f"Konfidenz: {dom_conf:.1f}%")
-c3.metric("Gegenwarts-Fit (In-Sample)", f"{recent_fit_quality:.1f} %", "Letzte 50 Kerzen")
+c2.metric("🎯 Dominanter Ehlers-Zyklus", f"{dom_period} Kerzen", f"Konfidenz: {dom_conf:.1f}%")
+c3.metric("Optimiertes Setup", f"{active_num_comp} Zyklen | WLS {active_wls_focus}", f"In-Sample Fit: {recent_fit_quality:.1f}%")
 c4.metric(
-    f"⏪ Backtest-Genauigkeit ({backtest_shift} Bars)",
+    f"⏪ Backtest ({backtest_shift} Bars)",
     f"{dir_accuracy:.1f} % Richtung",
     f"Korrelation: {bt_corr:.1f} %"
 )
@@ -350,11 +421,10 @@ c4.metric(
 st.markdown("---")
 
 # ----------------- Hauptchart -----------------
-st.subheader("📈 Realkurs, Walk-Forward-Backtest & Zukunftsprojektion")
+st.subheader(f"📈 {selected_coin} – Realkurs, Walk-Forward-Backtest & Zukunftsprojektion")
 
 fig = go.Figure()
 
-# 1. Realer Kurs
 fig.add_trace(go.Scatter(
     x=df_analysis.index,
     y=df_analysis['Close'],
@@ -363,7 +433,6 @@ fig.add_trace(go.Scatter(
     line=dict(color='#d1d4dc', width=1.8)
 ))
 
-# 2. Historischer Fit (Live-Modell)
 fig.add_trace(go.Scatter(
     x=df_analysis.index,
     y=projected_price[:N],
@@ -372,16 +441,14 @@ fig.add_trace(go.Scatter(
     line=dict(color='#3b82f6', width=1.5, dash='dot')
 ))
 
-# 3. Walk-Forward Backtest Kurve (Out-of-Sample)
 if enable_backtest:
     fig.add_trace(go.Scatter(
         x=df_bt_actual.index,
         y=bt_forecast_curve,
         mode='lines',
-        name=f'⏪ Walk-Forward Prognose (vor {backtest_shift} Bars berechnet)',
+        name=f'⏪ Optimierte Backtest-Prognose (vor {backtest_shift} Bars)',
         line=dict(color='#f59e0b', width=3)
     ))
-    # Vertikale Linie für Backtest-Start
     fig.add_vline(
         x=df_bt_actual.index[0].timestamp() * 1000,
         line_width=1.5,
@@ -389,7 +456,6 @@ if enable_backtest:
         line_color="#f59e0b"
     )
 
-# 4. Zukunftsprojektion (Live)
 fig.add_trace(go.Scatter(
     x=future_times,
     y=projected_price[N:],
@@ -425,27 +491,147 @@ fig.add_vline(
 
 fig.update_layout(
     template="plotly_dark",
-    height=560,
+    height=540,
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     margin=dict(l=20, r=20, t=40, b=20)
 )
 st.plotly_chart(fig, use_container_width=True)
 
-# ----------------- Detail-Tabs -----------------
-tab_bt, tab1, tab2, tab3 = st.tabs([
-    "⏪ Walk-Forward Backtest-Auswertung",
+# ----------------- Detail-Tabs inkl. Multi-Coin-Scanner -----------------
+tab_scan, tab_opt, tab_bt, tab1, tab2, tab3 = st.tabs([
+    "🌐 Multi-Coin Scanner (Markt-Ranking)",
+    "🏆 Auto-Optimizer Ranking",
+    "⏪ Backtest-Auswertung",
     "🎯 Zukünftige Wendepunkte",
     "🌊 Einzelne Zykluskomponenten",
-    "📡 Ehlers Multi-Peak Spektrum"
+    "📡 Ehlers Spektrum"
 ])
 
-with tab_bt:
-    st.markdown(f"##### ⏪ Detailvergleich: Prognose von vor {backtest_shift} Kerzen vs. Echter Kursverlauf")
+with tab_scan:
+    st.markdown(f"##### 🌐 Multi-Coin Walk-Forward Scanner ({tf_choice})")
     st.caption(
-        f"Stichtag der blinden Berechnung war der **{df_bt_train.index[-1].strftime('%d.%m.%Y %H:%M UTC')}**. "
-        f"Damals erkannte das Ehlers-Modell folgende Zyklen: **{', '.join([str(int(p)) for p in bt_active_p])} Kerzen**."
+        "Scannt die Top-Krypto-Assets, führt für jeden Coin eine Walk-Forward-Optimierung durch "
+        "und sortiert sie danach, welcher Markt sich aktuell am genauesten an sein Zyklusmodell hält."
     )
     
+    col_s1, col_s2 = st.columns([1, 2])
+    with col_s1:
+        num_scan_coins = st.slider("Anzahl zu scannender Coins", min_value=5, max_value=len(ALL_COINS), value=15, step=5)
+    with col_s2:
+        st.write("")
+        start_scan = st.button("🚀 Alle Coins jetzt scannen & ranken", type="primary", use_container_width=True)
+        
+    if start_scan:
+        scan_list = ALL_COINS[:num_scan_coins]
+        scan_rows = []
+        prog_text = st.empty()
+        prog_bar = st.progress(0)
+        tv_tf_code = TF_CONFIG[tf_choice]["tv"]
+        
+        for idx_c, c_sym in enumerate(scan_list):
+            prog_text.text(f"Optimiere & teste Zyklusmodell ({idx_c + 1}/{len(scan_list)}): {c_sym} ({tf_choice}) ...")
+            try:
+                df_c = fetch_candles(c_sym, tf_choice)
+                if df_c is not None and len(df_c) >= min_required:
+                    c_bt_train = df_c.iloc[-(lookback_bars + backtest_shift) : -backtest_shift]['Close'].values
+                    c_bt_actual = df_c.iloc[-backtest_shift:]['Close'].values
+                    
+                    _, _, c_bt_peaks, _, _ = ehlers_multi_peak_spectrum(c_bt_train, min_period, max_period, max_comp=8)
+                    best_c_row, _ = run_walk_forward_optimizer(
+                        c_bt_train, c_bt_actual, c_bt_peaks, backtest_shift, anchor_to_last
+                    )
+                    
+                    # Live-Prognose mit dem Gewinner-Setup des Coins berechnen
+                    c_live_df = df_c.iloc[-lookback_bars:]
+                    c_live_prices = c_live_df['Close'].values
+                    c_dom_p, c_conf, c_live_peaks, _, _ = ehlers_multi_peak_spectrum(
+                        c_live_prices, min_period, max_period, max_comp=8
+                    )
+                    
+                    opt_n = int(best_c_row["Zyklen"])
+                    opt_w = float(best_c_row["WLS-Fokus"])
+                    opt_d = int(best_c_row["Trend-Grad"])
+                    
+                    c_proj, _, _ = fit_high_precision_model(
+                        c_live_prices, c_live_peaks[:opt_n], forecast_bars, opt_w, opt_d, anchor_to_last
+                    )
+                    
+                    c_fut_curve = c_proj[len(c_live_prices):]
+                    c_tstep = c_live_df.index[-1] - c_live_df.index[-2]
+                    c_ftimes = [c_live_df.index[-1] + c_tstep * (k + 1) for k in range(forecast_bars)]
+                    
+                    c_pk, _ = find_peaks(c_fut_curve, distance=2)
+                    c_tr, _ = find_peaks(-c_fut_curve, distance=2)
+                    
+                    next_events = []
+                    for p_i in c_pk:
+                        next_events.append((int(p_i + 1), f"▼ TOP in +{p_i+1} Bars ({c_ftimes[p_i].strftime('%d.%m. %H:%M')})"))
+                    for t_i in c_tr:
+                        next_events.append((int(t_i + 1), f"▲ BODEN in +{t_i+1} Bars ({c_ftimes[t_i].strftime('%d.%m. %H:%M')})"))
+                        
+                    next_events.sort(key=lambda x: x[0])
+                    next_turn_str = next_events[0][1] if next_events else "—"
+                    
+                    tv_link = f"https://www.tradingview.com/chart/?symbol=BYBIT:{c_sym}USDT.P&interval={tv_tf_code}"
+                    
+                    scan_rows.append({
+                        "Symbol": f"{c_sym}USDT.P",
+                        "Gesamt-Score": float(best_c_row["Gesamt-Score"]),
+                        "Richtung (%)": float(best_c_row["Richtung (%)"]),
+                        "Korrelation (%)": float(best_c_row["Korrelation (%)"]),
+                        "Dom. Zyklus": f"{c_dom_p} Bars",
+                        "Opt. Setup": f"{opt_n} Zyk. | WLS {opt_w}",
+                        "Nächster Zyklus-Wendepunkt": next_turn_str,
+                        "TradingView": tv_link
+                    })
+            except Exception:
+                pass
+            prog_bar.progress((idx_c + 1) / len(scan_list))
+            time.sleep(0.03)
+            
+        prog_text.empty()
+        prog_bar.empty()
+        
+        if scan_rows:
+            st.session_state["last_scan_df"] = pd.DataFrame(scan_rows).sort_values(
+                by="Gesamt-Score", ascending=False
+            ).reset_index(drop=True)
+            
+    if "last_scan_df" in st.session_state:
+        st.dataframe(
+            st.session_state["last_scan_df"],
+            column_config={
+                "Gesamt-Score": st.column_config.ProgressColumn(
+                    "Walk-Forward Score", format="%.1f", min_value=0, max_value=100
+                ),
+                "Richtung (%)": st.column_config.NumberColumn("Richtungs-Quote", format="%.1f %%"),
+                "Korrelation (%)": st.column_config.NumberColumn("Kurven-Korrelation", format="%.1f %%"),
+                "TradingView": st.column_config.LinkColumn("Chart", display_text="Chart öffnen ↗")
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("Klicke oben auf '🚀 Alle Coins jetzt scannen & ranken', um die Rangliste der zyklisch präzisesten Coins zu erstellen.")
+
+with tab_opt:
+    st.markdown(f"##### 🏆 Rangliste der getesteten Parameter für {selected_coin} (Top 15)")
+    if opt_df is not None:
+        st.dataframe(
+            opt_df.head(15).drop(columns=["Trend-Grad"]),
+            column_config={
+                "Gesamt-Score": st.column_config.ProgressColumn("Gesamt-Score", format="%.1f", min_value=0, max_value=100),
+                "Richtung (%)": st.column_config.NumberColumn("Richtungs-Trefferquote", format="%.1f %%"),
+                "Korrelation (%)": st.column_config.NumberColumn("Kurven-Korrelation", format="%.1f %%")
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("Aktiviere links die Option '⚡ Auto-Optimizer aktivieren', um das Parameter-Ranking zu berechnen.")
+
+with tab_bt:
+    st.markdown(f"##### ⏪ Detailvergleich ({selected_coin}): Prognose von vor {backtest_shift} Kerzen vs. Echter Kursverlauf")
     col_bt1, col_bt2 = st.columns([3, 2])
     with col_bt1:
         fig_bt = go.Figure()
@@ -460,7 +646,7 @@ with tab_bt:
             x=df_bt_actual.index,
             y=bt_forecast_curve,
             mode='lines+markers',
-            name='Damalige Zyklus-Prognose (Soll)',
+            name='Optimierte Zyklus-Prognose (Soll)',
             line=dict(color='#f59e0b', width=2.5)
         ))
         fig_bt.update_layout(
@@ -480,7 +666,7 @@ with tab_bt:
             st.info("Im gewählten Backtest-Fenster lagen keine ausgeprägten Zyklus-Wendepunkte.")
 
 with tab1:
-    st.markdown("##### Chronologische Liste der nächsten Zyklus-Wendepunkte (Live-Prognose)")
+    st.markdown(f"##### Chronologische Liste der nächsten Zyklus-Wendepunkte ({selected_coin})")
     if turning_points:
         df_tp = pd.DataFrame(turning_points).sort_values(by="Kerzen entfernt")
         df_tp = df_tp.drop(columns=["Kerzen entfernt"])
